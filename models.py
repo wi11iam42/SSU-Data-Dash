@@ -8,85 +8,97 @@ make_model() picks the model for each track. The two starting models are baselin
 deliberately simple, so you can measure how much your own ideas add.
 """
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingRegressor
+import pandas as pd
+
+from catboost import CatBoostRegressor
 
 import features
 
 
+class CatBoostOffMarket:
+    def __init__(self):
+        self.historical = features.HistoricalFeatures()
+
+        self.model = CatBoostRegressor(
+            iterations=1200,
+            depth=8,
+            learning_rate=0.04,
+            loss_function="RMSE",
+            l2_leaf_reg=5,
+            random_seed=42,
+            verbose=False,
+            allow_writing_files=False,
+            thread_count=-1,
+        )
+
+    def fit(self, train):
+        train = train.copy()
+
+        # Build historical statistics from the training sales.
+        self.historical.fit(train)
+
+        # Each training home's features use only sales before
+        # that home's listing date.
+        X = features.off_market_features(
+            train, self.historical
+        )
+
+        y = np.log(
+            pd.to_numeric(train["sold_price"], errors="coerce")
+        )
+
+        valid = (
+            y.notna()
+            & np.isfinite(y)
+            & (train["sold_price"] > 0)
+        )
+
+        X = X.loc[valid].copy()
+        y = y.loc[valid]
+
+        self.cat_features = X.select_dtypes(
+            include=["object", "category", "string"]
+        ).columns.tolist()
+
+        # CatBoost accepts missing numeric values.
+        # Categorical missing values have already become strings.
+        for col in self.cat_features:
+            X[col] = X[col].fillna("Unknown").astype(str)
+
+        self.model.fit(
+            X,
+            y,
+            cat_features=self.cat_features,
+        )
+
+        return self
+
+    def predict(self, homes):
+        X = features.off_market_features(
+            homes, self.historical
+        )
+
+        for col in self.cat_features:
+            X[col] = X[col].fillna("Unknown").astype(str)
+
+        predictions = np.exp(self.model.predict(X))
+
+        return np.maximum(predictions, 1)
+
+
 def make_model(track):
-    """Return a fresh, untrained model for "off_market" or "list_aware"."""
-    if track == "list_aware":
-        return ListPriceBaseline()
-        # return FeatureModel(features.list_aware_features)   # try this instead
-    return NearestSalesBaseline(k=10)
-    # return FeatureModel(features.off_market_features)       # try this instead
+    """Return a fresh model for the requested competition track."""
+
+    if track == "off_market":
+        return CatBoostOffMarket()
+
+    # Keep the original list-price baseline for now.
+    return ListPriceBaseline()
 
 
 class ListPriceBaseline:
-    """List-aware baseline: every home sells for exactly its list price."""
-
     def fit(self, train):
-        return self   # nothing to learn
+        return self
 
     def predict(self, homes):
         return homes["list_price"].to_numpy(dtype=float)
-
-
-class NearestSalesBaseline:
-    """Off-market baseline: the median sold price of the k nearest earlier sales of
-    the same property type.
-
-    "Nearest" means closest by latitude and longitude. "Earlier" means sold before the
-    home was listed, so the model never looks into the future, even when the
-    training table holds later sales. It makes no adjustment for size, condition or
-    for prices moving since those sales: improving on that is your job.
-    """
-
-    def __init__(self, k=10):
-        self.k = k
-
-    def fit(self, train):
-        columns = ["ml_num", "house_type_name", "date_sold", "latitude", "longitude", "sold_price"]
-        # Newest sales first, so when several sales are equally near (a condo
-        # building shares one location), the most recent ones are picked.
-        self.sales = train[columns].sort_values(["date_sold", "ml_num"], ascending=[False, True])
-        self.sales_by_type = dict(list(self.sales.groupby("house_type_name")))
-        return self
-
-    def predict(self, homes):
-        return np.array([self.predict_one(home) for _, home in homes.iterrows()])
-
-    def predict_one(self, home):
-        sales = self.sales_by_type.get(home["house_type_name"], self.sales)
-        earlier = sales[sales["date_sold"] < home["date_listed"]]
-        if len(earlier) == 0:   # no earlier sale of this type: use every type
-            earlier = self.sales[self.sales["date_sold"] < home["date_listed"]]
-
-        # Distance in degrees. In Toronto a degree of longitude is only 0.72 times as
-        # long as a degree of latitude (0.72 = cosine of 43.7 degrees north).
-        dx = (earlier["longitude"].to_numpy() - home["longitude"]) * 0.72
-        dy = earlier["latitude"].to_numpy() - home["latitude"]
-        distance = np.sqrt(dx ** 2 + dy ** 2)
-
-        nearest = np.argsort(distance, kind="stable")[: self.k]
-        return float(np.median(earlier["sold_price"].to_numpy()[nearest]))
-
-
-class FeatureModel:
-    """A machine-learning model (gradient-boosted trees) on the features in features.py.
-
-    It learns log(price) rather than price, so a 10% miss on a cheap condo counts
-    as much as a 10% miss on an expensive house. Not used until you switch it on
-    in make_model().
-    """
-
-    def __init__(self, make_features):
-        self.make_features = make_features
-        self.model = HistGradientBoostingRegressor(random_state=0)
-
-    def fit(self, train):
-        self.model.fit(self.make_features(train), np.log(train["sold_price"]))
-        return self
-
-    def predict(self, homes):
-        return np.exp(self.model.predict(self.make_features(homes)))
